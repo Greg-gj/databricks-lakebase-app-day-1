@@ -1,260 +1,115 @@
-"""
-Databricks App boilerplate:
-- Serves a small Flask API
-- Reads/writes to Lakebase (Databricks-managed Postgres) via lakebase.py
-- Pulls data from the Massive API via massive_client.py and syncs it into Lakebase
-
-Run locally:
-    python app.py
-Deploy as a Databricks App using app.yaml.
-"""
-
-import logging
-import os
-import re
-
+import streamlit as st
 import requests
-from databricks.sdk import WorkspaceClient
-from flask import Flask, jsonify, render_template, request
 
-import lakebase
-from massive_client import MassiveClient
+BACKEND_URL = "http://localhost:8000"
 
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger("massive-app")
+st.set_page_config(page_title="Support Hub", layout="wide")
+st.title("🎫 Enterprise AI Support Operations Hub")
 
-app = Flask(__name__)
-_w = WorkspaceClient()
+# --- BONUS FEATURE: FILTER BY STATUS ---
+status_choice = st.sidebar.selectbox("🎯 Filter Operations Pipeline", ["All", "open", "in_progress", "resolved"])
 
-TABLE_NAME = os.environ.get("MASSIVE_TABLE_NAME", "massive_records")
-WATCHLIST_TABLE_NAME = os.environ.get("WATCHLIST_TABLE_NAME", "watchlist")
+# Fetch filtered tickets from backend
+try:
+    res = requests.get(f"{BACKEND_URL}/tickets", params={"status_filter": status_choice})
+    tickets = res.json() if res.status_code == 200 else []
+except Exception:
+    tickets = []
+    st.error("Could not reach backend API cluster service.")
 
-# Basic stock ticker shape check: 1-10 uppercase letters, with an optional
-# ".X" or ".XX" share-class suffix (e.g. "BRK.B"). This rejects obviously
-# malformed input before we even call the Massive API.
-_TICKER_RE = re.compile(r"^[A-Z]{1,10}(\.[A-Z]{1,2})?$")
+# --- BONUS FEATURE: INPUT VALIDATION DISPLAY ---
+with st.sidebar.form("new_ticket_panel", clear_on_submit=True):
+    st.subheader("🆕 Open Operational Ticket")
+    input_title = st.text_input("Brief Problem Statement Summary")
+    input_author = st.text_input("Requester Corporate Email Address")
+    submit_btn = st.form_submit_button("Launch Support Ticket Instance")
+    
+    if submit_btn:
+        payload = {"title": input_title, "created_by": input_author}
+        post_res = requests.post(f"{BACKEND_URL}/tickets", json=payload)
+        if post_res.status_code == 200:
+            st.success("Ticket pushed into operational state ledger!")
+            st.rerun()
+        else:
+            # Displays the exact validation failure generated cleanly by Pydantic
+            error_data = post_res.json()
+            error_msg = error_data.get('detail', 'Unknown validation anomaly.')
+            if isinstance(error_msg, list):  # Handle multiple Pydantic structural errors
+                error_msg = error_msg[0].get('msg', 'Invalid inputs.')
+            st.error(f"❌ Input Validation Refused: {error_msg}")
 
+# Main Layout splitting
+if not tickets:
+    st.info("No matching tickets residing in active memory logs.")
+else:
+    options_map = {f"#{t['ticket_id']} | {t['title']} ({t['status'].upper()})": t for t in tickets}
+    selected_key = st.selectbox("📂 Select Active Workspace Ticket Profile File Instance:", list(options_map.keys()))
+    current_ticket = options_map[selected_key]
+    
+    st.divider()
+    
+    c1, c2, c3 = st.columns([2, 1, 1])
+    with c1:
+        st.subheader(f"Subject: {current_ticket['title']}")
+        st.caption(f"Opened by: {current_ticket['created_by']} | Timestamp: {current_ticket['created_at']}")
+    with c2:
+        current_idx = ["open", "in_progress", "resolved"].index(current_ticket['status'])
+        status_selector = st.selectbox("State Transition", ["open", "in_progress", "resolved"], index=current_idx)
+        if st.button("Apply State Change"):
+            requests.put(f"{BACKEND_URL}/tickets/{current_ticket['ticket_id']}/status", json={"status": status_selector})
+            st.rerun()
+            
+    with c3:
+        st.write("🛠️ Pipeline Destruction")
+        # --- BONUS FEATURE: DELETE ACTION WITH CONFIRMATION STEP ---
+        if f"confirm_delete_{current_ticket['ticket_id']}" not in st.session_state:
+            st.session_state[f"confirm_delete_{current_ticket['ticket_id']}"] = False
+            
+        if not st.session_state[f"confirm_delete_{current_ticket['ticket_id']}"]:
+            if st.button("🗑️ Delete Ticket Instance", key=f"del_init_{current_ticket['ticket_id']}"):
+                st.session_state[f"confirm_delete_{current_ticket['ticket_id']}"] = True
+                st.rerun()
+        else:
+            st.warning("⚠️ Are you sure?")
+            col_b1, col_b2 = st.columns(2)
+            with col_b1:
+                if st.button("🔥 Yes, Delete", key=f"del_conf_{current_ticket['ticket_id']}"):
+                    requests.delete(f"{BACKEND_URL}/tickets/{current_ticket['ticket_id']}")
+                    st.session_state[f"confirm_delete_{current_ticket['ticket_id']}"] = False
+                    st.success("Ticket dropped!")
+                    st.rerun()
+            with col_b2:
+                if st.button("❌ Abort", key=f"del_abort_{current_ticket['ticket_id']}"):
+                    st.session_state[f"confirm_delete_{current_ticket['ticket_id']}"] = False
+                    st.rerun()
 
-def ensure_table():
-    """Create the destination table in Lakebase if it doesn't exist yet."""
-    lakebase.run_write(
-        f"""
-        CREATE TABLE IF NOT EXISTS {TABLE_NAME} (
-            id TEXT PRIMARY KEY,
-            payload JSONB NOT NULL,
-            synced_at TIMESTAMPTZ NOT NULL DEFAULT now()
-        )
-        """
-    )
+    # --- BONUS FEATURE: CHAT DESIGN UI OVERHAUL ---
+    st.markdown("### 💬 Interactive Message Stream Threads")
+    msg_res = requests.get(f"{BACKEND_URL}/tickets/{current_ticket['ticket_id']}/messages")
+    messages_list = msg_res.json() if msg_res.status_code == 200 else []
+    
+    for message in messages_list:
+        is_agent = "agent" in message['author'] or "admin" in message['author']
+        with st.chat_message("assistant" if is_agent else "user"):
+            st.markdown(f"**{message['author']}**")
+            st.write(message['message_text'])
+            st.caption(f"Time Record: {message['created_at']}")
 
-
-def ensure_watchlist_table():
-    """Create the watchlist table in Lakebase if it doesn't exist yet."""
-    lakebase.run_write(
-        f"""
-        CREATE TABLE IF NOT EXISTS {WATCHLIST_TABLE_NAME} (
-            symbol TEXT NOT NULL,
-            email TEXT NOT NULL,
-            latest_price NUMERIC,
-            updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-            PRIMARY KEY (symbol, email)
-        )
-        """
-    )
-
-
-def _current_user_email() -> str:
-    """
-    Resolve the current user's email so the watchlist can be personalized.
-
-    Databricks Apps inject the logged-in user's identity via the
-    X-Forwarded-Email header on every request. Fall back to the Databricks
-    SDK's current_user API for local development where that header isn't set.
-    """
-    header_email = request.headers.get("X-Forwarded-Email")
-    if header_email:
-        return header_email
-    return _w.current_user.me().user_name
-
-
-@app.route("/healthz")
-def healthz():
-    return jsonify({"status": "ok"})
-
-
-@app.errorhandler(Exception)
-def handle_exception(err):
-    """Ensure all unhandled errors return JSON (not an HTML error page),
-    so the frontend's resp.json() call never chokes on HTML."""
-    logger.exception("Unhandled exception while processing request")
-    status_code = getattr(err, "code", 500)
-    if not isinstance(status_code, int):
-        status_code = 500
-    return jsonify({"error": str(err)}), status_code
-
-
-@app.route("/")
-def index():
-    """Simple UI to submit a list of stock symbols to sync from Massive."""
-    return render_template("index.html")
-
-
-@app.route("/records")
-def list_records():
-    """Read records already synced into Lakebase."""
-    limit = int(request.args.get("limit", 100))
-    rows = lakebase.run_query(
-        f"SELECT id, payload, synced_at FROM {TABLE_NAME} ORDER BY synced_at DESC LIMIT %s",
-        (limit,),
-    )
-    return jsonify(rows)
-
-
-@app.route("/sync", methods=["POST"])
-def sync_from_massive():
-    """
-    Pull data from the Massive API (paginated, potentially huge dataset) and
-    upsert it into Lakebase in batches.
-    """
-    ensure_table()
-    client = MassiveClient()
-
-    path = request.json.get("path", "/records") if request.is_json else "/records"
-    batch_size = int(request.args.get("batch_size", 500))
-
-    batch = []
-    total = 0
-    for item in client.paginated_get(path):
-        batch.append(item)
-        if len(batch) >= batch_size:
-            total += _upsert_batch(batch)
-            batch = []
-
-    if batch:
-        total += _upsert_batch(batch)
-
-    return jsonify({"synced": total})
-
-
-@app.route("/watchlist", methods=["GET"])
-def get_watchlist():
-    """Return the current user's watchlist symbols, with their last known price."""
-    ensure_watchlist_table()
-    email = _current_user_email()
-    rows = lakebase.run_query(
-        f"SELECT symbol, email, latest_price, updated_at FROM {WATCHLIST_TABLE_NAME} "
-        f"WHERE email = %s ORDER BY symbol ASC",
-        (email,),
-    )
-    return jsonify(rows)
-
-
-@app.route("/watchlist", methods=["POST"])
-def add_to_watchlist():
-    """
-    Fetch the latest price for a single stock symbol from Massive using
-    exactly ONE API call (see MassiveClient.get_latest_price), then add/
-    update that symbol on the watchlist in Lakebase.
-    """
-    ensure_watchlist_table()
-
-    if request.is_json:
-        symbol = request.json.get("symbol", "")
-    else:
-        symbol = request.form.get("symbol", "")
-
-    symbol = symbol.strip().upper() if isinstance(symbol, str) else ""
-
-    if not symbol or not _TICKER_RE.match(symbol):
-        return jsonify({"error": f"Invalid ticker symbol: {symbol!r}"}), 400
-
-    client = MassiveClient()
-    try:
-        data = client.get_latest_price(symbol)  # <-- single API call, latest price only
-    except requests.HTTPError:
-        # Massive returns a 404/4xx for tickers it doesn't recognize.
-        return jsonify({"error": f"Unknown ticker symbol: {symbol}"}), 400
-
-    price = _extract_latest_price(data)
-    if price is None:
-        # No usable price in the response (e.g. delisted/invalid ticker
-        # that still 200s with an empty result set) - don't add it.
-        return jsonify({"error": f"No price data available for ticker: {symbol}"}), 400
-
-    email = _current_user_email()
-
-    lakebase.run_write(
-        f"""
-        INSERT INTO {WATCHLIST_TABLE_NAME} (symbol, email, latest_price, updated_at)
-        VALUES (%s, %s, %s, now())
-        ON CONFLICT (symbol, email) DO UPDATE
-            SET latest_price = EXCLUDED.latest_price,
-                updated_at = EXCLUDED.updated_at
-        """,
-        (symbol, email, price),
-    )
-
-    return jsonify({"symbol": symbol, "email": email, "latest_price": price})
-
-
-def _extract_latest_price(data: dict) -> float | None:
-    """Pull the trade price out of the Massive 'previous close' response shape.
-
-    The /v2/aggs/ticker/{symbol}/prev endpoint returns "results" as a LIST
-    containing a single aggregate bar (not a dict), e.g.:
-        {"status": "OK", "resultsCount": 1, "results": [{"c": 148.845, ...}]}
-    Previously this code treated "results" as a dict, so isinstance(results, dict)
-    was always False for this endpoint's real shape and the price silently
-    resolved to None. Unwrap the list here, and check "status"/"resultsCount"
-    so invalid tickers (empty results) are detected instead of "succeeding"
-    with a null price.
-
-    Adjust the key lookup here if the real Massive API returns a different
-    field name for the traded/close price.
-    """
-    if not isinstance(data, dict):
-        return None
-    if data.get("status") not in (None, "OK") or data.get("resultsCount") == 0:
-        return None
-    results = data.get("results", data)
-    if isinstance(results, list):
-        results = results[0] if results else None
-    if isinstance(results, dict):
-        for key in ("c", "p", "price", "last_price", "vw"):
-            if key in results:
-                return results[key]
-    return None
-
-
-def _upsert_batch(items: list[dict]) -> int:
-    """Upsert a batch of Massive API items into Lakebase, one statement per row.
-
-    For very large batches, consider psycopg2.extras.execute_values for
-    higher throughput instead of per-row execute calls.
-    """
-    import json as _json
-
-    count = 0
-    with lakebase.get_connection() as conn:
-        with conn.cursor() as cur:
-            for item in items:
-                cur.execute(
-                    f"""
-                    INSERT INTO {TABLE_NAME} (id, payload, synced_at)
-                    VALUES (%s, %s, now())
-                    ON CONFLICT (id) DO UPDATE
-                        SET payload = EXCLUDED.payload,
-                            synced_at = EXCLUDED.synced_at
-                    """,
-                    (str(item.get("id")), _json.dumps(item)),
-                )
-                count += 1
-            conn.commit()
-    return count
-
-
-if __name__ == '__main__':
-    host = os.getenv('FLASK_RUN_HOST', '0.0.0.0')
-    port = int(os.getenv('FLASK_RUN_PORT', 8000))
-    app.run(debug=True, host=host, port=port)
-    print(f"Flask app running on http://{host}:{port}")
+    with st.form("append_message_form", clear_on_submit=True):
+        st.write("✏️ Write Response Dispatch Log")
+        reply_author = st.text_input("Responder Account ID Email")
+        reply_text = st.text_area("Message Content Framework Context")
+        submit_reply = st.form_submit_button("Transmit Message Frame")
+        
+        if submit_reply:
+            msg_payload = {"message_text": reply_text, "author": reply_author}
+            post_msg_res = requests.post(f"{BACKEND_URL}/tickets/{current_ticket['ticket_id']}/messages", json=msg_payload)
+            if post_msg_res.status_code == 200:
+                st.success("Message committed cleanly!")
+                st.rerun()
+            else:
+                error_data = post_msg_res.json()
+                msg_error = error_data.get('detail', 'Validation fault block error.')
+                if isinstance(msg_error, list):
+                    msg_error = msg_error[0].get('msg', 'Invalid inputs.')
+                st.error(f"❌ Input Validation Refused: {msg_error}")

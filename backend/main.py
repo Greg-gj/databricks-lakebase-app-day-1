@@ -1,18 +1,11 @@
 from fastapi import FastAPI, HTTPException, status
 from pydantic import BaseModel, Field, EmailStr
 from typing import List, Optional
-import psycopg2
-from psycopg2.extras import RealDictCursor
-import os
+
+# Import your centralized database helper context manager from lakebase.py
+from .lakebase import get_connection 
 
 app = FastAPI(title="Ticketing System Backend")
-
-DB_URL = os.environ.get("lakebase-url")
-
-def get_db_connection():
-    if not DB_URL:
-        raise HTTPException(status_code=500, detail="LAKEBASE_URL environment variable is missing.")
-    return psycopg2.connect(DB_URL)
 
 # --- PYDANTIC VALIDATION MODELS (BONUS CHALLENGE) ---
 class TicketCreate(BaseModel):
@@ -26,84 +19,85 @@ class MessageCreate(BaseModel):
 class StatusUpdate(BaseModel):
     status: str = Field(..., description="Must be open, in_progress, or resolved.")
 
+
 @app.get("/tickets")
 def get_tickets(status_filter: Optional[str] = None):
-    conn = get_db_connection()
-    cur = conn.cursor(cursor_factory=RealDictCursor)
-    if status_filter and status_filter != "All":
-        cur.execute("SELECT * FROM tickets WHERE status = %s ORDER BY created_at DESC;", (status_filter,))
-    else:
-        cur.execute("SELECT * FROM tickets ORDER BY created_at DESC;")
-    tickets = cur.fetchall()
-    cur.close()
-    conn.close()
-    return tickets
+    try:
+        with get_connection() as conn:
+            with conn.cursor() as cur:
+                if status_filter and status_filter != "All":
+                    cur.execute("SELECT * FROM tickets WHERE status = %s ORDER BY created_at DESC;", (status_filter,))
+                else:
+                    cur.execute("SELECT * FROM tickets ORDER BY created_at DESC;")
+                return cur.fetchall()
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Database Read Error: {str(e)}")
+
 
 @app.post("/tickets")
 def create_ticket(ticket: TicketCreate):
-    conn = get_db_connection()
-    cur = conn.cursor()
     try:
-        cur.execute(
-            "INSERT INTO tickets (title, status, created_by) VALUES (%s, 'open', %s) RETURNING ticket_id;",
-            (ticket.title, ticket.created_by)
-        )
-        ticket_id = cur.fetchone()[0]
-        conn.commit()
-        return {"message": "Ticket created successfully", "ticket_id": ticket_id}
+        with get_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "INSERT INTO tickets (title, status, created_by) VALUES (%s, 'open', %s) RETURNING ticket_id;",
+                    (ticket.title, ticket.created_by)
+                )
+                # Since lakebase.py uses RealDictCursor, we read row data as a dictionary key
+                ticket_id = cur.fetchone()["ticket_id"]
+                conn.commit()
+                return {"message": "Ticket created successfully", "ticket_id": ticket_id}
     except Exception as e:
-        conn.rollback()
         raise HTTPException(status_code=400, detail=str(e))
-    finally:
-        cur.close()
-        conn.close()
+
 
 @app.get("/tickets/{ticket_id}/messages")
 def get_messages(ticket_id: int):
-    conn = get_db_connection()
-    cur = conn.cursor(cursor_factory=RealDictCursor)
-    cur.execute("SELECT * FROM ticket_messages WHERE ticket_id = %s ORDER BY created_at ASC;", (ticket_id,))
-    messages = cur.fetchall()
-    cur.close()
-    conn.close()
-    return messages
+    try:
+        with get_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT * FROM ticket_messages WHERE ticket_id = %s ORDER BY created_at ASC;", (ticket_id,))
+                return cur.fetchall()
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Message Retrieval Error: {str(e)}")
+
 
 @app.post("/tickets/{ticket_id}/messages")
 def add_message(ticket_id: int, msg: MessageCreate):
-    conn = get_db_connection()
-    cur = conn.cursor()
     try:
-        cur.execute(
-            "INSERT INTO ticket_messages (ticket_id, message_text, author) VALUES (%s, %s, %s);",
-            (ticket_id, msg.message_text, msg.author)
-        )
-        conn.commit()
-        return {"message": "Message added successfully"}
+        with get_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "INSERT INTO ticket_messages (ticket_id, message_text, author) VALUES (%s, %s, %s);",
+                    (ticket_id, msg.message_text, msg.author)
+                )
+                conn.commit()
+                return {"message": "Message added successfully"}
     except Exception as e:
-        conn.rollback()
         raise HTTPException(status_code=400, detail=str(e))
-    finally:
-        cur.close()
-        conn.close()
+
 
 @app.put("/tickets/{ticket_id}/status")
 def update_status(ticket_id: int, payload: StatusUpdate):
     if payload.status not in ["open", "in_progress", "resolved"]:
         raise HTTPException(status_code=400, detail="Invalid status assignment value.")
-    conn = get_db_connection()
-    cur = conn.cursor()
-    cur.execute("UPDATE tickets SET status = %s WHERE ticket_id = %s;", (payload.status, ticket_id))
-    conn.commit()
-    cur.close()
-    conn.close()
-    return {"message": "Status updated successfully"}
+    try:
+        with get_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute("UPDATE tickets SET status = %s WHERE ticket_id = %s;", (payload.status, ticket_id))
+                conn.commit()
+                return {"message": "Status updated successfully"}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Status Mutation Error: {str(e)}")
+
 
 @app.delete("/tickets/{ticket_id}")
 def delete_ticket(ticket_id: int):
-    conn = get_db_connection()
-    cur = conn.cursor()
-    cur.execute("DELETE FROM tickets WHERE ticket_id = %s;", (ticket_id,))
-    conn.commit()
-    cur.close()
-    conn.close()
-    return {"message": "Ticket dropped cleanly"}
+    try:
+        with get_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute("DELETE FROM tickets WHERE ticket_id = %s;", (ticket_id,))
+                conn.commit()
+                return {"message": "Ticket dropped cleanly"}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Deletion Error: {str(e)}")
